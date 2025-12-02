@@ -1,0 +1,3 @@
+[submodule "chess-env"]
+	path = chess-env
+	url = git@gitlab.aicrowd.com:aicrowd/challenges/agi-house-trainium-hackathon-2025/chess-env.git

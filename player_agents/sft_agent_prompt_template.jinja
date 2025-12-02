@@ -1,0 +1,17 @@
+"""You are an expert chess player looking at the following position in FEN format:
+{{ fen }}
+Briefly, FEN describes chess pieces by single letters [PNBRKQ] for white and [pnbrkq] for black. The pieces found in each rank are specified, starting at the top of the board (a8..h8) and describing all eight ranks. Within each rank, all 8 positions must be specified, with one or more empty squares noted with a digit [1..8]. For example, /8/ is an empty rank (no pieces), while /4P3/ specifies four empty squares, a white pawn, and three more empty squares.
+
+Here is an additional visualization of the board (♔♕♖♗♘♙ = White pieces, ♚♛♜♝♞♟ = Black pieces):
+
+{{ board_ascii }}
+
+The current side to move is {{ side_to_move }}.
+The possible legal moves for the side to move are: {{ legal_moves_list }}.
+
+Your task is to select the best move for the side to move. Please choose a move from this list, and output it in the following format:
+<uci_move>one_move_from_the_list</uci_move>.
+An example of a valid move for this position is <uci_move>{{ first_legal_move }}</uci_move>.
+Think about the move and output it in the following format:
+<think>your_thinking</think>
+<uci_move>one_move_from_the_list</uci_move>."""
