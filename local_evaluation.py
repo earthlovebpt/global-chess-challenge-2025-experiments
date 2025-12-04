@@ -11,9 +11,12 @@ import os
 import re
 import sys
 import time
+import json
 import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from jinja2 import Template
 
@@ -22,7 +25,7 @@ import chess
 # Add chess-env to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chess-env"))
 
-from agents import ChessAgent, RandomAgent, StockfishAgent
+from agents import ChessAgent, RandomAgent
 from env import ChessEnvironment
 from run_game import _StockfishAnalyzer
 from chess_renderer import ChessRenderer
@@ -424,6 +427,50 @@ class OpenAIEndpointAgent(ChessAgent):
         self.move_times = []
 
 
+class StockfishAgent(ChessAgent):
+    """Simple Stockfish agent using python-chess engine."""
+    
+    def __init__(self, depth: int = 1, skill_level: int = 0, time_limit_ms: int = 100):
+        """
+        Initialize Stockfish agent.
+        
+        Args:
+            depth: Search depth for Stockfish
+            skill_level: Skill level (0-20, lower is weaker)
+            time_limit_ms: Time limit in milliseconds
+        """
+        self.depth = depth
+        self.skill_level = skill_level
+        self.time_limit_ms = time_limit_ms
+        self.engine = chess.engine.SimpleEngine.popen_uci("stockfish")
+        if skill_level is not None:
+            self.engine.configure({"Skill Level": skill_level})
+    
+    def choose_move(
+        self,
+        board: chess.Board,
+        legal_moves: List[chess.Move],
+        move_history: List[str],
+        side_to_move: str,
+    ) -> Tuple[Optional[chess.Move], Optional[str]]:
+        """Choose a move using Stockfish."""
+        if not legal_moves:
+            return None, "No legal moves available"
+        
+        try:
+            result = self.engine.play(
+                board,
+                chess.engine.Limit(depth=self.depth, time=self.time_limit_ms / 1000.0)
+            )
+            return result.move, "Stockfish move"
+        except Exception as e:
+            print(f"Stockfish error: {e}")
+            return None, f"Stockfish error: {e}"
+    
+    def close(self):
+        """Close the Stockfish engine."""
+        if hasattr(self, 'engine'):
+            self.engine.quit()
 
 
 def play_game(player_agent: OpenAIEndpointAgent, opponent_agent: ChessAgent,
@@ -485,22 +532,90 @@ def play_game(player_agent: OpenAIEndpointAgent, opponent_agent: ChessAgent,
     }
 
 
+def save_game_log(
+    game_num: int,
+    opponent_name: str,
+    player_color: str,
+    game_result: dict,
+    white_acpl: float,
+    black_acpl: float,
+    timestamp: str
+):
+    """
+    Save game data to a JSON file in the logs/ directory.
+    
+    Args:
+        game_num: Game number
+        opponent_name: Name of the opponent
+        player_color: "white" or "black"
+        game_result: Dictionary with game result data
+        white_acpl: White's average centipawn loss
+        black_acpl: Black's average centipawn loss
+        timestamp: Timestamp string for the log filename
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Determine player ACPL based on color
+    player_acpl = white_acpl if player_color == "white" else black_acpl
+    opponent_acpl = black_acpl if player_color == "white" else white_acpl
+    
+    # Create game data structure
+    game_data = {
+        "timestamp": timestamp,
+        "game_number": game_num,
+        "opponent": opponent_name,
+        "player_color": player_color,
+        "result": game_result["result"],
+        "moves_played": game_result["moves_played"],
+        "move_history": game_result["move_history"],
+        "player_acpl": player_acpl,
+        "opponent_acpl": opponent_acpl,
+        "white_acpl": white_acpl,
+        "black_acpl": black_acpl,
+        "player_avg_time_per_move": game_result.get("white_time" if player_color == "white" else "black_time", 0.0)
+    }
+    
+    # Generate filename with timestamp and game number
+    # Safe opponent name (replace spaces and special chars)
+    safe_opponent = opponent_name.replace(" ", "_").replace("(", "").replace(")", "").replace(",", "")
+    filename = f"game_{timestamp}_{safe_opponent}_{player_color}_g{game_num}.json"
+    filepath = os.path.join(logs_dir, filename)
+    
+    # Write JSON file
+    with open(filepath, 'w') as f:
+        json.dump(game_data, f, indent=2)
+    
+    return filepath
+
+
 def evaluate_against_opponent(
     player_agent: OpenAIEndpointAgent,
     opponent_name: str,
     opponent_agent: ChessAgent,
     num_games: int = 10,
-    verbose: bool = False
+    verbose: bool = False,
+    base_url: str = None,
+    api_key: str = None,
+    max_retries: int = None,
+    template_file: str = None,
+    debug: bool = False
 ) -> EvaluationResults:
     """
     Evaluate player agent against a specific opponent.
     
     Args:
-        player_agent: The player agent being evaluated
+        player_agent: The player agent being evaluated (used for config only)
         opponent_name: Name of the opponent (for reporting)
         opponent_agent: The opponent agent
         num_games: Number of games to play (must be even)
         verbose: Whether to print game progress
+        base_url: Base URL for creating new player agents per game
+        api_key: API key for creating new player agents per game
+        max_retries: Max retries for creating new player agents per game
+        template_file: Template file for creating new player agents per game
+        debug: Debug mode for creating new player agents per game
     
     Returns:
         EvaluationResults object with statistics
@@ -513,72 +628,109 @@ def evaluate_against_opponent(
     print(f"{'='*70}")
     print(f"Playing {num_games} games ({num_games//2} as white, {num_games//2} as black)")
     
+    # Create timestamp for this evaluation session
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     games_per_color = num_games // 2
+    
+    def play_and_analyze_game(game_num: int, player_color: str):
+        """Play a single game and analyze it."""
+        # Create a fresh player agent for this game
+        game_player_agent = OpenAIEndpointAgent(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
+            template_file=template_file,
+            debug=debug
+        )
+        
+        # Create a fresh opponent agent for this game (especially important for Stockfish)
+        if isinstance(opponent_agent, StockfishAgent):
+            game_opponent_agent = StockfishAgent(
+                depth=opponent_agent.depth if hasattr(opponent_agent, 'depth') else 1,
+                skill_level=opponent_agent.skill_level if hasattr(opponent_agent, 'skill_level') else 0
+            )
+        elif isinstance(opponent_agent, RandomAgent):
+            game_opponent_agent = RandomAgent()
+        else:
+            game_opponent_agent = opponent_agent  # Fallback to shared instance
+        
+        try:
+            game_result = play_game(game_player_agent, game_opponent_agent, player_color, game_num, verbose)
+            
+            # Analyze ACPL - create a new analyzer for each game since it closes after analyze_game
+            white_acpl = 0.0
+            black_acpl = 0.0
+            if len(game_result["move_history"]) > 0:
+                try:
+                    analyzer = _StockfishAnalyzer(depth=20, movetime_ms=1000)
+                    acpl_result = analyzer.analyze_game(game_result["move_history"])
+                    white_acpl = acpl_result["white_acpl"]
+                    black_acpl = acpl_result["black_acpl"]
+                except Exception as e:
+                    print(f"Warning: ACPL analysis failed for game {game_num}: {e}")
+            
+            stats = GameStats(
+                result=game_result["result"],
+                moves_played=game_result["moves_played"],
+                white_time=game_result["white_time"],
+                black_time=game_result["black_time"],
+                white_acpl=white_acpl,
+                black_acpl=black_acpl,
+                player_color=player_color
+            )
+            
+            # Save game log
+            log_path = save_game_log(
+                game_num=game_num,
+                opponent_name=opponent_name,
+                player_color=player_color,
+                game_result=game_result,
+                white_acpl=white_acpl,
+                black_acpl=black_acpl,
+                timestamp=timestamp
+            )
+            
+            player_acpl = white_acpl if player_color == "white" else black_acpl
+            player_time = game_result['white_time'] if player_color == "white" else game_result['black_time']
+            
+            print(f"✓ Game {game_num}/{num_games} ({player_color}): {game_result['result']} "
+                  f"in {game_result['moves_played']} moves "
+                  f"(Player ACPL: {player_acpl:.1f}, Time: {player_time:.2f}s)")
+            
+            return stats
+        finally:
+            # Clean up the game-specific opponent agent
+            if hasattr(game_opponent_agent, 'close'):
+                game_opponent_agent.close()
+    
+    # Play all games in parallel
     game_stats = []
-    
-    # Play games as white
-    for i in range(games_per_color):
-        game_num = i + 1
-        game_result = play_game(player_agent, opponent_agent, "white", game_num, verbose)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all games
+        futures = []
         
-        # Analyze ACPL - create a new analyzer for each game since it closes after analyze_game
-        white_acpl = 0.0
-        black_acpl = 0.0
-        if len(game_result["move_history"]) > 0:
+        # Games as white
+        for i in range(games_per_color):
+            game_num = i + 1
+            future = executor.submit(play_and_analyze_game, game_num, "white")
+            futures.append(future)
+        
+        # Games as black
+        for i in range(games_per_color):
+            game_num = games_per_color + i + 1
+            future = executor.submit(play_and_analyze_game, game_num, "black")
+            futures.append(future)
+        
+        # Collect results
+        for future in as_completed(futures):
             try:
-                analyzer = _StockfishAnalyzer(depth=20, movetime_ms=100)
-                acpl_result = analyzer.analyze_game(game_result["move_history"])
-                white_acpl = acpl_result["white_acpl"]
-                black_acpl = acpl_result["black_acpl"]
+                stats = future.result()
+                game_stats.append(stats)
             except Exception as e:
-                print(f"Warning: ACPL analysis failed for game {game_num}: {e}")
-        
-        stats = GameStats(
-            result=game_result["result"],
-            moves_played=game_result["moves_played"],
-            white_time=game_result["white_time"],
-            black_time=game_result["black_time"],
-            white_acpl=white_acpl,
-            black_acpl=black_acpl,
-            player_color="white"
-        )
-        game_stats.append(stats)
-        
-        print(f"✓ Game {game_num}/{num_games} (white): {game_result['result']} "
-              f"in {game_result['moves_played']} moves "
-              f"(Player ACPL: {white_acpl:.1f}, Time: {game_result['white_time']:.2f}s)")
-    
-    # Play games as black
-    for i in range(games_per_color):
-        game_num = games_per_color + i + 1
-        game_result = play_game(player_agent, opponent_agent, "black", game_num, verbose)
-        
-        # Analyze ACPL - create a new analyzer for each game since it closes after analyze_game
-        white_acpl = 0.0
-        black_acpl = 0.0
-        if len(game_result["move_history"]) > 0:
-            try:
-                analyzer = _StockfishAnalyzer(depth=10)
-                acpl_result = analyzer.analyze_game(game_result["move_history"])
-                white_acpl = acpl_result["white_acpl"]
-                black_acpl = acpl_result["black_acpl"]
-            except Exception as e:
-                print(f"Warning: ACPL analysis failed for game {game_num}: {e}")
-        
-        stats = GameStats(
-            result=game_result["result"],
-            moves_played=game_result["moves_played"],
-            white_time=game_result["white_time"],
-            black_time=game_result["black_time"],
-            white_acpl=white_acpl,
-            black_acpl=black_acpl,
-            player_color="black"
-        )
-        game_stats.append(stats)
-        
-        print(f"✓ Game {game_num}/{num_games} (black): {game_result['result']} "
-              f"in {game_result['moves_played']} moves "
-              f"(Player ACPL: {black_acpl:.1f}, Time: {game_result['black_time']:.2f}s)")
+                print(f"Error in game execution: {e}")
+                import traceback
+                traceback.print_exc()
     
     # Calculate statistics
     wins = 0
@@ -683,7 +835,7 @@ def main():
     parser.add_argument(
         "--games-per-opponent",
         type=int,
-        default=2,
+        default=10,
         help="Number of games to play per opponent (must be even)"
     )
     parser.add_argument(
@@ -702,6 +854,12 @@ def main():
         type=int,
         default=1,
         help="Stockfish opponent depth (default: 1)"
+    )
+    parser.add_argument(
+        "--stockfish-skill",
+        type=int,
+        default=0,
+        help="Stockfish opponent skill level 0-20 (default: 0, lower is weaker)"
     )
     parser.add_argument(
         "--template-file",
@@ -730,34 +888,30 @@ def main():
     print(f"Max retries:         {args.max_retries}")
     print(f"ACPL analysis:       Enabled")
     print(f"Stockfish depth:     {args.stockfish_depth}")
+    print(f"Stockfish skill:     {args.stockfish_skill}")
     print(f"Template file:       {args.template_file if args.template_file else 'Default (built-in)'}")
     print(f"Debug mode:          {'Enabled' if args.debug else 'Disabled'}")
     
-    # Create player agent
-    player_agent = OpenAIEndpointAgent(
-        base_url=args.endpoint,
-        api_key=args.api_key,
-        max_retries=args.max_retries,
-        template_file=args.template_file,
-        debug=args.debug
-    )
+    # Show logs directory
+    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+    print(f"Game logs directory: {logs_dir}")
     
     # Create opponents
     opponents = []
     
     # Random agent
-    try:
-        random_agent = RandomAgent()
-        opponents.append(("Random Agent", random_agent))
-        print(f"✓ Created Random Agent opponent")
-    except Exception as e:
-        print(f"✗ Failed to create Random Agent: {e}")
+    # try:
+    #     random_agent = RandomAgent()
+    #     opponents.append(("Random Agent", random_agent))
+    #     print(f"✓ Created Random Agent opponent")
+    # except Exception as e:
+    #     print(f"✗ Failed to create Random Agent: {e}")
     
     # Stockfish agent
     try:
-        stockfish_agent = StockfishAgent(depth=args.stockfish_depth, skill_level=0)
-        opponents.append((f"Stockfish (depth {args.stockfish_depth}, skill 0)", stockfish_agent))
-        print(f"✓ Created Stockfish opponent (depth {args.stockfish_depth}, skill level 0)")
+        stockfish_agent = StockfishAgent(depth=args.stockfish_depth, skill_level=args.stockfish_skill, time_limit_ms=100)
+        opponents.append((f"Stockfish (depth {args.stockfish_depth}, skill {args.stockfish_skill})", stockfish_agent))
+        print(f"✓ Created Stockfish opponent (depth {args.stockfish_depth}, skill level {args.stockfish_skill})")
     except Exception as e:
         print(f"✗ Failed to create Stockfish agent: {e}")
         print("   Make sure Stockfish is installed on your system")
@@ -766,26 +920,55 @@ def main():
         print("\nError: No opponents available. Exiting.")
         sys.exit(1)
     
-    # Run evaluation against each opponent
-    results = []
-    for opponent_name, opponent_agent in opponents:
+    # Run evaluation against each opponent using ThreadPoolExecutor
+    def evaluate_opponent_task(opponent_name, opponent_agent):
+        """Task wrapper for parallel evaluation."""
+        # Create a dummy player agent just for config reference
+        dummy_player_agent = OpenAIEndpointAgent(
+            base_url=args.endpoint,
+            api_key=args.api_key,
+            max_retries=args.max_retries,
+            template_file=args.template_file,
+            debug=args.debug
+        )
+        
         try:
             result = evaluate_against_opponent(
-                player_agent=player_agent,
+                player_agent=dummy_player_agent,
                 opponent_name=opponent_name,
                 opponent_agent=opponent_agent,
                 num_games=args.games_per_opponent,
-                verbose=args.verbose
+                verbose=args.verbose,
+                base_url=args.endpoint,
+                api_key=args.api_key,
+                max_retries=args.max_retries,
+                template_file=args.template_file,
+                debug=args.debug
             )
-            results.append(result)
+            return result
         except Exception as e:
             print(f"\nError evaluating against {opponent_name}: {e}")
             import traceback
             traceback.print_exc()
+            return None
         finally:
-            # Clean up Stockfish agents
+            # Clean up Stockfish agents (the original one, game-specific ones are cleaned up in evaluate_against_opponent)
             if hasattr(opponent_agent, 'close'):
                 opponent_agent.close()
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all evaluation tasks
+        future_to_opponent = {
+            executor.submit(evaluate_opponent_task, opponent_name, opponent_agent): opponent_name
+            for opponent_name, opponent_agent in opponents
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_opponent):
+            result = future.result()
+            if result is not None:
+                results.append(result)
     
     # Print final results
     if results:
