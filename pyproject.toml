@@ -1,0 +1,38 @@
+[project]
+name = "global-chess-challenge-2025-experiments"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aicrowd-cli>=0.1.18",
+    "black>=23.0.0",
+    "datasets==4.3.0",
+    "flake8>=6.0.0",
+    "flashinfer-python==0.3.1",
+    "flask>=3.1.2",
+    "huggingface-hub>=0.24.0",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "jinja2>=3.1.6",
+    "jupyter>=1.1.1",
+    "langchain>=1.2.0",
+    "langchain-openai>=1.1.6",
+    "mypy>=1.0.0",
+    "openai>=1.0.0",
+    "p-tqdm>=1.4.0",
+    "peft>=0.18.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "python-chess>=1.10.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "stockfish>=3.28.0",
+    "transformers[torch]==4.56.2",
+    "trl==0.22.2",
+    "trueskill>=0.4.5",
+    "unsloth==2025.12.8",
+    "unsloth-zoo>=2025.7.4",
+    "vllm==0.10.2",
+    "wandb>=0.23.1",
+]
