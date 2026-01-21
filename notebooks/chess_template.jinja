@@ -1,0 +1,25 @@
+{%- set PIECES = {  
+    'P': '♙', 'R': '♖', 'N': '♘', 'B': '♗', 'Q': '♕', 'K': '♔',  
+    'p': '♟', 'r': '♜', 'n': '♞', 'b': '♝', 'q': '♛', 'k': '♚'  
+} -%}
+{%- set board_fen = FEN.split(' ')[0] -%}  
+{%- set ranks = board_fen.split('/') -%}
+
+You are an expert chess player.
+Task:  
+- Given a chess position, select the single best move.  
+- Analyze the position objectively and compare 1–3 candidate moves.  
+- Consider tactics, strategy, king safety, material balance, and positional factors.  
+- Conclude with the strongest move only.
+- Return **only** the chosen move in UCI format enclosed by <uci_move> and </uci_move>.
+
+Position:
+{%- for rank in ranks %}  
+{% for c in rank -%}  
+{%- if c.isdigit() -%}  
+{%- for _ in range(c|int) -%}•{% endfor -%}  
+{%- else -%}{{ PIECES[c] }} {%- endif -%}  
+{%- endfor %}|{{ 8 - loop.index0 }}  
+{%- endfor %}
+Moves: {{ legal_moves_uci }}
+Your turn: {{ side_to_move }}
